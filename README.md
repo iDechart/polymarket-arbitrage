@@ -20,9 +20,7 @@
 
 ### 🎥 Video Demo
 
-https://github.com/ImMike/polymarket-arbitrage/assets/video/Polymarket-Arb-clip.mp4
-
-> **📹 Can't see the video?** [Click here to download and watch](Polymarket-Arb-clip.mp4)
+[**▶️ Watch Demo Video (Click to Download)**](https://github.com/ImMike/polymarket-arbitrage/raw/main/Polymarket-Arb-clip.mp4)
 
 *Watch the bot in action - scanning 5,000+ markets and finding opportunities in real-time*
 
