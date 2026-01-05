@@ -6,17 +6,43 @@ FastAPI-based web server for the trading dashboard.
 """
 
 import asyncio
+import os
+import hmac
 import json
 import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, HTTPException, status
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
+from starlette.middleware.base import BaseHTTPMiddleware
 
 logger = logging.getLogger(__name__)
+
+# ---- Security configuration (all optional) ----
+DASHBOARD_TOKEN = os.getenv("DASHBOARD_TOKEN")  # if set, all endpoints require this token
+# Comma-separated allowed origins for WebSocket connections (exact match).
+DASHBOARD_ALLOWED_ORIGINS = [o.strip() for o in os.getenv("DASHBOARD_ALLOWED_ORIGINS", "http://localhost,http://127.0.0.1").split(",") if o.strip()]
+DASHBOARD_MAX_WS_CONNECTIONS = int(os.getenv("DASHBOARD_MAX_WS_CONNECTIONS", "50"))
+DASHBOARD_MAX_WS_MESSAGE_BYTES = int(os.getenv("DASHBOARD_MAX_WS_MESSAGE_BYTES", "32768"))  # 32KB
+
+def _constant_time_equals(a: str, b: str) -> bool:
+    try:
+        return hmac.compare_digest(a.encode("utf-8"), b.encode("utf-8"))
+    except Exception:
+        return False
+
+def _extract_bearer_token(auth_header: str | None) -> str | None:
+    if not auth_header:
+        return None
+    parts = auth_header.split()
+    if len(parts) == 2 and parts[0].lower() == "bearer":
+        return parts[1]
+    return None
+
+
 
 
 class DashboardState:
@@ -144,6 +170,40 @@ class DashboardState:
 dashboard_state = DashboardState()
 
 
+class SecurityHeadersAndAuthMiddleware(BaseHTTPMiddleware):
+    """Adds basic security headers and (optionally) requires a bearer/query token."""
+
+    async def dispatch(self, request: Request, call_next):
+        # Auth (optional)
+        if DASHBOARD_TOKEN:
+            path = request.url.path
+            if not (path.startswith("/static") or path in ("/health",)):
+                token = _extract_bearer_token(request.headers.get("authorization")) or request.query_params.get("token")
+                if not token or not _constant_time_equals(token, DASHBOARD_TOKEN):
+                    return HTMLResponse("Unauthorized", status_code=status.HTTP_401_UNAUTHORIZED)
+
+        response = await call_next(request)
+
+        # Security headers
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+        # Note: dashboard uses inline CSS/JS, so we allow unsafe-inline here. If you externalize scripts/styles,
+        # tighten this CSP.
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "img-src 'self' data:; "
+            "style-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "connect-src 'self' ws: wss:; "
+            "object-src 'none'; "
+            "base-uri 'self'; "
+            "frame-ancestors 'none'"
+        )
+        return response
+
+
 def create_app() -> FastAPI:
     """Create the FastAPI application."""
     app = FastAPI(
@@ -151,78 +211,105 @@ def create_app() -> FastAPI:
         description="Live monitoring dashboard for the trading bot",
         version="1.0.0",
     )
-    
-    # Serve static files
+    app.add_middleware(SecurityHeadersAndAuthMiddleware)
+
+    # Static assets (if present)
     static_dir = Path(__file__).parent / "static"
     if static_dir.exists():
         app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
-    
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
+
     @app.get("/", response_class=HTMLResponse)
     async def index():
         """Serve the main dashboard page."""
-        html_path = Path(__file__).parent / "templates" / "index.html"
-        if html_path.exists():
-            return html_path.read_text()
-        return get_embedded_html()
-    
+        return HTMLResponse(get_embedded_html())
+
     @app.get("/api/state")
     async def get_state():
-        """Get current dashboard state."""
+        """Get full dashboard state."""
         return dashboard_state.to_dict()
-    
+
     @app.get("/api/markets")
     async def get_markets():
-        """Get current market data."""
+        """Get market data."""
         return {"markets": dashboard_state.markets}
-    
+
     @app.get("/api/opportunities")
     async def get_opportunities():
         """Get recent opportunities."""
         return {"opportunities": dashboard_state.opportunities[-50:]}
-    
+
     @app.get("/api/portfolio")
     async def get_portfolio():
         """Get portfolio state."""
         return dashboard_state.portfolio
-    
+
     @app.get("/api/risk")
     async def get_risk():
         """Get risk metrics."""
         return dashboard_state.risk
-    
+
     @app.get("/api/timing")
     async def get_timing():
         """Get opportunity timing statistics."""
         return dashboard_state.timing
-    
+
     @app.websocket("/ws")
     async def websocket_endpoint(websocket: WebSocket):
         """WebSocket endpoint for real-time updates."""
+        # Optional Origin allowlist (defends against cross-site WebSocket hijacking)
+        origin = websocket.headers.get("origin")
+        if origin and DASHBOARD_ALLOWED_ORIGINS and origin not in DASHBOARD_ALLOWED_ORIGINS:
+            await websocket.close(code=1008)
+            return
+
+        # Optional token auth
+        if DASHBOARD_TOKEN:
+            token = _extract_bearer_token(websocket.headers.get("authorization")) or websocket.query_params.get("token")
+            if not token or not _constant_time_equals(token, DASHBOARD_TOKEN):
+                await websocket.close(code=1008)
+                return
+
+        # Connection limit (basic DoS protection)
+        if len(dashboard_state._connections) >= DASHBOARD_MAX_WS_CONNECTIONS:
+            await websocket.close(code=1013)  # Try again later
+            return
+
         await websocket.accept()
         dashboard_state._connections.append(websocket)
-        
+
         try:
             # Send initial state
             await websocket.send_text(json.dumps({
                 "type": "initial",
                 "data": dashboard_state.to_dict()
             }))
-            
+
             # Keep connection alive and receive any commands
             while True:
                 try:
-                    data = await asyncio.wait_for(
-                        websocket.receive_text(),
-                        timeout=30.0
-                    )
-                    # Handle any commands from client
-                    msg = json.loads(data)
-                    if msg.get("type") == "ping":
-                        await websocket.send_text(json.dumps({"type": "pong"}))
+                    data = await asyncio.wait_for(websocket.receive_text(), timeout=30.0)
+
+                    # Ignore oversized payloads to avoid memory/CPU abuse
+                    if len(data.encode("utf-8")) > DASHBOARD_MAX_WS_MESSAGE_BYTES:
+                        continue
+
+                    # Simple ping/pong support
+                    try:
+                        msg = json.loads(data)
+                        if isinstance(msg, dict) and msg.get("type") == "ping":
+                            await websocket.send_text(json.dumps({"type": "pong"}))
+                    except Exception:
+                        # Ignore malformed client messages
+                        continue
+
                 except asyncio.TimeoutError:
                     # Send heartbeat
                     await websocket.send_text(json.dumps({"type": "heartbeat"}))
-                    
+
         except WebSocketDisconnect:
             pass
         except Exception as e:
@@ -230,7 +317,7 @@ def create_app() -> FastAPI:
         finally:
             if websocket in dashboard_state._connections:
                 dashboard_state._connections.remove(websocket)
-    
+
     return app
 
 
@@ -1608,10 +1695,20 @@ def get_embedded_html() -> str:
         let ws = null;
         let state = {};
         let reconnectAttempts = 0;
+
+        const urlParams = new URLSearchParams(window.location.search);
+        const dashboardToken = urlParams.get('token');
+
+        function authUrl(path) {
+            if (!dashboardToken) return path;
+            const sep = path.includes('?') ? '&' : '?';
+            return `${path}${sep}token=${encodeURIComponent(dashboardToken)}`;
+        }
+
         
         function connect() {
             const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws${dashboardToken ? `?token=${encodeURIComponent(dashboardToken)}` : ''}`);
             
             ws.onopen = () => {
                 console.log('WebSocket connected');
@@ -1952,7 +2049,17 @@ def get_embedded_html() -> str:
             }
         }
         
-        function formatNumber(num) {
+        function escapeHtml(str) {
+            if (str === null || str === undefined) return '';
+            return String(str)
+                .replaceAll('&', '&amp;')
+                .replaceAll('<', '&lt;')
+                .replaceAll('>', '&gt;')
+                .replaceAll('"', '&quot;')
+                .replaceAll("'", '&#039;');
+        }
+
+function formatNumber(num) {
             if (num >= 1000000) return (num / 1000000).toFixed(1) + 'M';
             if (num >= 1000) return (num / 1000).toFixed(1) + 'K';
             return num.toString();
@@ -2411,7 +2518,7 @@ def get_embedded_html() -> str:
         // Fetch initial state via REST as backup
         async function fetchState() {
             try {
-                const response = await fetch('/api/state');
+                const response = await fetch(authUrl('/api/state'));
                 state = await response.json();
                 updateDashboard();
             } catch (e) {

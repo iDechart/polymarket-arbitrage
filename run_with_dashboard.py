@@ -13,6 +13,7 @@ Usage:
 """
 
 import argparse
+import os
 import asyncio
 import logging
 import signal
@@ -45,6 +46,7 @@ class TradingBotWithDashboard:
     def __init__(self, config: BotConfig, port: int = 8888):
         self.config = config
         self.port = port
+        self.bind = bind
         self._running = False
         
         # Components - Polymarket
@@ -191,7 +193,7 @@ class TradingBotWithDashboard:
         """Start the uvicorn server."""
         config = uvicorn.Config(
             app,
-            host="0.0.0.0",
+            host=self.bind,
             port=self.port,
             log_level="warning",
             access_log=False,
@@ -496,6 +498,13 @@ def main() -> None:
         type=int,
         default=8888,
         help="Dashboard port (default: 8888)"
+    )
+
+    parser.add_argument(
+        "--bind",
+        type=str,
+        default=None,
+        help="Bind address for dashboard (default: 127.0.0.1 or env DASHBOARD_BIND)"
     )
     
     parser.add_argument(

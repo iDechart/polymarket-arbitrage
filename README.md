@@ -414,3 +414,22 @@ MIT License - See [LICENSE](LICENSE) for details
 Made with ☕ and Python by [ImMike](https://github.com/ImMike)
 
 </div>
+
+
+## Security hardening (dashboard)
+
+- By default, the dashboard should be bound to `127.0.0.1` (localhost). Use `--bind 0.0.0.0` only behind a reverse proxy and firewall.
+- Set `DASHBOARD_TOKEN` to require a bearer token (or `?token=` query param) for all endpoints.
+- Configure `DASHBOARD_ALLOWED_ORIGINS` to your dashboard origin(s) to protect WebSocket connections.
+- The server sets basic security headers (CSP, X-Frame-Options, etc.).
+
+### Example
+
+```bash
+export DASHBOARD_TOKEN=$(python - <<'PY'
+import secrets; print(secrets.token_urlsafe(32))
+PY
+)
+export DASHBOARD_ALLOWED_ORIGINS=https://dashboard.example.com
+python run_with_dashboard.py --port 8888 --bind 127.0.0.1
+```
