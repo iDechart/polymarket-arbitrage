@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 class TradingBotWithDashboard:
     """Trading bot with integrated dashboard."""
     
-    def __init__(self, config: BotConfig, port: int = 8888):
+    def __init__(self, config: BotConfig, port: int = 8888, bind: str = "127.0.0.1"):
         self.config = config
         self.port = port
         self.bind = bind
